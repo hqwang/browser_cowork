@@ -21,9 +21,7 @@ description: Auto-fill the Feishu "Subo 流水线表单" using a JSON file produ
 
 默认读 `/tmp/xq-info.json`，可通过 `XQ_INFO_IN` 环境变量覆盖。
 
-## 表单地址
-
-固定为公司内部表单：<https://b3sh6jivuw.feishu.cn/share/base/form/shrcnJAnk4pUjerGBOaWHTFiJIf>
+`表单地址` 待填充的表单地址，需要用户提供，例如： <https://b3sh6jivuw.feishu.cn/share/base/form/shrcnJAnk4pUjerGBOaWHTFiJIf>
 
 ## 要做的事
 

@@ -1,6 +1,6 @@
 # 一次性安装 browser-harness 并连接 Chrome
 
-`browser-harness`（<https://github.com/browser-use/browser-harness>）是一个轻量的 CDP 桥，让 Python 直接控制用户已经登录飞书的真实 Chrome。两个 skill 都依赖它，第一次用前装一次。
+`browser-harness`（<https://github.com/browser-use/browser-harness>）是一个轻量的 CDP 桥，让 Python 直接控制用户已经登录飞书的真实 Chrome。第一次用前装一次。
 
 ## 先决条件
 
