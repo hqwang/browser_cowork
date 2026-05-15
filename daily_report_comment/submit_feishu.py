@@ -95,6 +95,13 @@ _REVIEW_RULES = _load_review_rules(SCRIPT_DIR / "日报审核规则.md")
 _DIMENSION_NAMES = list(_REVIEW_RULES.keys())
 
 
+def _reload_rules(md_path: Path) -> None:
+    """用指定文件重新加载审核规则，覆盖模块级全局变量。"""
+    global _REVIEW_RULES, _DIMENSION_NAMES
+    _REVIEW_RULES = _load_review_rules(md_path)
+    _DIMENSION_NAMES = list(_REVIEW_RULES.keys())
+
+
 def _gen_temp_rules() -> list[str]:
     """每个维度各随机抽 1 条子项，得到 len(维度) 条临时规则（共 6 条）。"""
     return [random.choice(items) for items in _REVIEW_RULES.values()]
@@ -263,7 +270,7 @@ def _find_heading_id(date: str, name: str) -> str | None:
     }})()""")
 
 
-def extract_and_build_rows(date: str, n_comments: int = 1, temp_rules: list[str] | None = None) -> list:
+def extract_and_build_rows(date: str, n_comments: int = 3, temp_rules: list[str] | None = None) -> list:
     """提取指定日期日报内容，返回 comment 行列表。
 
     关键设计：大纲是全量加载的（不受虚拟滚动影响），用它获取成员列表；
@@ -549,7 +556,23 @@ def main():
         metavar="N",
         help="每位成员生成的 comment 数量（默认 1）",
     )
+    parser.add_argument(
+        "--rules",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="审核规则 Markdown 文件路径（默认使用脚本目录下的 日报审核规则.md）",
+    )
     args = parser.parse_args()
+
+    # 若指定了自定义规则文件，重新加载
+    if args.rules:
+        rules_path = args.rules.expanduser().resolve()
+        if not rules_path.exists():
+            print(f"✗ 规则文件不存在：{rules_path}")
+            sys.exit(1)
+        _reload_rules(rules_path)
+        print(f"✓ 已加载自定义规则文件：{rules_path}")
 
     # 获取进程锁，防止重复运行
     acquire_lock()
