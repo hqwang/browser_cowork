@@ -95,40 +95,52 @@ _REVIEW_RULES = _load_review_rules(SCRIPT_DIR / "日报审核规则.md")
 _DIMENSION_NAMES = list(_REVIEW_RULES.keys())
 
 
-def _gen_comment(text: str) -> str:
-    """随机从一个维度抽 1 条子项作为 comment。"""
-    dim = random.choice(_DIMENSION_NAMES)
-    return random.choice(_REVIEW_RULES[dim])
+def _gen_temp_rules() -> list[str]:
+    """每个维度各随机抽 1 条子项，得到 len(维度) 条临时规则（共 6 条）。"""
+    return [random.choice(items) for items in _REVIEW_RULES.values()]
 
 
-def _gen_comment_llm(member_name: str, full_text: str) -> str:
-    """调用大模型，根据日报内容和审核规则，生成一条有针对性的 comment。"""
-    rules_text = "\n".join(
-        f"【{dim}】" + " / ".join(items)
-        for dim, items in _REVIEW_RULES.items()
-    )
+def _gen_comments_llm(member_name: str, full_text: str, temp_rules: list[str], n: int = 1) -> list[str]:
+    """调用大模型，根据日报内容和临时规则，生成 n 条有针对性的 comment。
+
+    Args:
+        member_name: 成员姓名
+        full_text:   该成员当日日报全文
+        temp_rules:  本轮从各维度随机抽取的临时规则列表
+        n:           需要生成的 comment 数量
+
+    Returns:
+        长度恰好为 n 的字符串列表，每条不超过 40 字。
+    """
+    rules_text = "\n".join(f"{i + 1}. {r}" for i, r in enumerate(temp_rules))
 
     prompt = f"""你是一位团队 leader，正在给下属的日报写 comment。
 
-审核关注点（供参考，不要照搬原文）：
+本次审核关注点（共 {len(temp_rules)} 条，请优先围绕这些角度给建议）：
 {rules_text}
 
 {member_name} 今日日报：
 {full_text}
 
 要求：
-- 针对日报中最值得跟进或改进的一个点，给出一句话建议
+- 针对日报中值得跟进或改进的点，给出 {n} 条建议
+- 每条建议单独一行，不加编号或前缀
 - 说话像真人，口语化，不要 AI 腔
-- 不超过 40 字
-- 直接输出 comment，不要前缀、不要解释"""
+- 每条不超过 40 字
+- 直接输出 comment，不要任何解释"""
 
     client = anthropic.Anthropic()
     resp = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=100,
+        max_tokens=100 * n,
         messages=[{"role": "user", "content": prompt}],
     )
-    return resp.content[0].text.strip()
+    lines = [ln.strip() for ln in resp.content[0].text.strip().splitlines() if ln.strip()]
+    # 确保恰好 n 条：多截少补
+    fallback = "今日日报请补充具体内容。"
+    while len(lines) < n:
+        lines.append(lines[-1] if lines else fallback)
+    return lines[:n]
 
 
 # ── CDP 拖选（isTrusted=true，可触发飞书工具栏）─────────────────
@@ -223,12 +235,22 @@ def _find_heading_id(date: str, name: str) -> str | None:
     }})()""")
 
 
-def extract_and_build_rows(date: str) -> list:
+def extract_and_build_rows(date: str, n_comments: int = 1, temp_rules: list[str] | None = None) -> list:
     """提取指定日期日报内容，返回 comment 行列表。
 
     关键设计：大纲是全量加载的（不受虚拟滚动影响），用它获取成员列表；
     然后逐个导航到每位成员，触发其内容块渲染后再提取。
+
+    Args:
+        date:       日期字符串，如 "0513"
+        n_comments: 每位成员生成的 comment 数量（默认 1）
+        temp_rules: 本轮临时规则列表（每维度各 1 条）；为 None 时自动生成
     """
+    if temp_rules is None:
+        temp_rules = _gen_temp_rules()
+    print(f"  临时审核规则（{len(temp_rules)} 条）:")
+    for i, r in enumerate(temp_rules, 1):
+        print(f"    {i}. {r}")
     code = (SCRIPT_DIR / "extract_content.js").read_text()
 
     # Step 1：从大纲获取该日期下的完整成员列表
@@ -310,16 +332,19 @@ def extract_and_build_rows(date: str) -> list:
             valid_blocks.append((b, text))
 
         if valid_blocks:
-            # 随机从审核规则里抽取一条 comment
+            # 用临时规则 + LLM 生成 n_comments 条 comment
             full_text = "\n".join(t for _, t in valid_blocks)
-            comment = _gen_comment(full_text)
-            first_b, first_text = valid_blocks[0]
-            rows.append({
-                "member":  name,
-                "snippet": first_text[:40],
-                "blockId": first_b["blockId"],
-                "comment": comment,
-            })
+            comments = _gen_comments_llm(name, full_text, temp_rules, n_comments)
+            for idx, comment in enumerate(comments):
+                # 尽量将不同 comment 分散到不同 block；超出时复用最后一个 block
+                block_idx = min(idx, len(valid_blocks) - 1)
+                b, text = valid_blocks[block_idx]
+                rows.append({
+                    "member":  name,
+                    "snippet": text[:40],
+                    "blockId": b["blockId"],
+                    "comment": comment,
+                })
         else:
             # 空报或内容全被过滤：comment 挂到 heading3（轮询时已拿到）
             if heading_id:
@@ -438,6 +463,13 @@ def main():
             "submit=读取已有 draft JSON 直接提交"
         ),
     )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        metavar="N",
+        help="每位成员生成的 comment 数量（默认 1）",
+    )
     args = parser.parse_args()
 
     # 获取进程锁，防止重复运行
@@ -472,7 +504,9 @@ def _main(args):
     # ── extract / full：需要打开飞书提取内容 ─────────────────────
     _open_and_inject(args.url)
 
-    rows = extract_and_build_rows(args.date)
+    # 每轮运行统一生成一组临时规则，所有成员共用同一组规则
+    temp_rules = _gen_temp_rules()
+    rows = extract_and_build_rows(args.date, n_comments=args.count, temp_rules=temp_rules)
     if not rows:
         print("✗ 无可提交内容"); sys.exit(1)
 
@@ -486,7 +520,7 @@ def _main(args):
         return
 
     # full 模式：继续弹窗 + 提交
-    print(f"✓ 生成 {len(rows)} 条 comment 建议")
+    print(f"✓ 生成 {len(rows)} 条 comment 建议（每人 {args.count} 条）")
     confirmed = inject_modal_and_wait(rows)
     if not confirmed:
         sys.exit(0)
