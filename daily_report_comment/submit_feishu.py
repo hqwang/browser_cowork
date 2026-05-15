@@ -462,9 +462,10 @@ def get_span_coord(block_id, snippet):
 
 # ── 批量提交 ─────────────────────────────────────────────────
 
-def submit_all(confirmed: list) -> list:
+def submit_all(confirmed: list, date: str = "") -> list:
     results = []
     total = len(confirmed)
+    last_navigated = None
     for i, item in enumerate(confirmed):
         member   = item["member"]
         snippet  = item["snippet"]
@@ -474,6 +475,28 @@ def submit_all(confirmed: list) -> list:
 
         js("window.__closeCommentPanel && window.__closeCommentPanel()")
         wait(0.6)
+
+        # 打开侧边栏，点击日期下对应的人，等待段落渲染后再查找
+        if date and member != last_navigated:
+            # Step 1: 确保侧边栏（大纲）已打开
+            if not js("window.__isCatalogueLoaded && window.__isCatalogueLoaded()"):
+                ensure_catalogue()
+                wait(1.0)
+
+            # Step 2: 在侧边栏中点击日期下该成员的条目
+            nav_coord = js(f'window.__navToMember("{date}", "{member}")')
+            if nav_coord and "error" not in str(nav_coord):
+                print(f"  → 侧边栏点击: {nav_coord.get('text', member)}")
+                _nav_click(nav_coord)
+                # Step 3: 轮询等待 heading3 出现在 DOM，确保虚拟列表已渲染（最多 8 秒）
+                for _ in range(16):
+                    wait(0.5)
+                    if _find_heading_id(date, member):
+                        break
+                wait(0.8)  # 额外等待内容块继续渲染
+            else:
+                print(f"  ⚠ 侧边栏未找到 {member}: {nav_coord}")
+            last_navigated = member
 
         coord = get_span_coord(block_id, snippet)
         if not coord:
@@ -554,7 +577,7 @@ def _main(args):
         confirmed = inject_modal_and_wait(rows)
         if not confirmed:
             sys.exit(0)
-        _finish(confirmed)
+        _finish(confirmed, date=args.date)
         return
 
     # ── extract / full：需要打开飞书提取内容 ─────────────────────
@@ -580,7 +603,7 @@ def _main(args):
     confirmed = inject_modal_and_wait(rows)
     if not confirmed:
         sys.exit(0)
-    _finish(confirmed)
+    _finish(confirmed, date=args.date)
 
 
 def _open_and_inject(url: str):
@@ -593,10 +616,10 @@ def _open_and_inject(url: str):
     print("✓ 大纲已加载")
 
 
-def _finish(confirmed: list):
+def _finish(confirmed: list, date: str = ""):
     # 批量提交
     print("\n开始批量提交...")
-    results = submit_all(confirmed)
+    results = submit_all(confirmed, date=date)
 
     # 汇总
     ok   = sum(1 for r in results if r.get("success"))
