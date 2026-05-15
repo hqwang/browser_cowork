@@ -552,7 +552,7 @@ def main():
     parser.add_argument(
         "--count",
         type=int,
-        default=1,
+        default=3,
         metavar="N",
         help="每位成员生成的 comment 数量（默认 1）",
     )
