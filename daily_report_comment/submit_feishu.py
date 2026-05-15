@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-import anthropic
+import subprocess  # noqa: F401 (保留备用)
 
 # ── 进程锁：防止同时运行两个实例 ────────────────────────────────
 LOCK_FILE = Path("/tmp/feishu_submit.lock")
@@ -100,47 +100,75 @@ def _gen_temp_rules() -> list[str]:
     return [random.choice(items) for items in _REVIEW_RULES.values()]
 
 
-def _gen_comments_llm(member_name: str, full_text: str, temp_rules: list[str], n: int = 1) -> list[str]:
-    """调用大模型，根据日报内容和临时规则，生成 n 条有针对性的 comment。
+def _gen_comments_llm_batch(members_data: list[dict], temp_rules: list[str], n: int = 1) -> dict[str, list[str]]:
+    """批量调用大模型，一次性为所有成员生成 comment。
 
     Args:
-        member_name: 成员姓名
-        full_text:   该成员当日日报全文
-        temp_rules:  本轮从各维度随机抽取的临时规则列表
-        n:           需要生成的 comment 数量
+        members_data: [{"member_name": str, "full_text": str}, ...]
+        temp_rules:   本轮从各维度随机抽取的临时规则列表
+        n:            每人需要生成的 comment 数量
 
     Returns:
-        长度恰好为 n 的字符串列表，每条不超过 40 字。
+        {member_name: [comment, ...]} 字典，每人恰好 n 条（由调用方补足）。
     """
+    req_file  = SCRIPT_DIR / "_llm_request_batch.json"
+    resp_file = SCRIPT_DIR / "_llm_response_batch.json"
+
+    if resp_file.exists():
+        resp_file.unlink()
+
     rules_text = "\n".join(f"{i + 1}. {r}" for i, r in enumerate(temp_rules))
 
-    prompt = f"""你是一位团队 leader，正在给下属的日报写 comment。
+    items = []
+    for md in members_data:
+        name      = md["member_name"]
+        full_text = md["full_text"]
+        prompt = (
+            f"你是一位团队 leader，正在给下属的日报写 comment。\n\n"
+            f"本次审核关注点（共 {len(temp_rules)} 条，请优先围绕这些角度给建议）：\n"
+            f"{rules_text}\n\n"
+            f"{name} 今日日报：\n{full_text}\n\n"
+            f"要求：\n"
+            f"- 针对日报中值得跟进或改进的点，给出 {n} 条建议\n"
+            f"- 每条建议单独一行，不加编号或前缀\n"
+            f"- 说话像真人，口语化，不要 AI 腔\n"
+            f"- 每条不超过 40 字\n"
+            f"- 直接输出 comment，不要任何解释"
+        )
+        items.append({
+            "member_name": name,
+            "full_text":   full_text,
+            "prompt":      prompt,
+            "n":           n,
+        })
 
-本次审核关注点（共 {len(temp_rules)} 条，请优先围绕这些角度给建议）：
-{rules_text}
-
-{member_name} 今日日报：
-{full_text}
-
-要求：
-- 针对日报中值得跟进或改进的点，给出 {n} 条建议
-- 每条建议单独一行，不加编号或前缀
-- 说话像真人，口语化，不要 AI 腔
-- 每条不超过 40 字
-- 直接输出 comment，不要任何解释"""
-
-    client = anthropic.Anthropic()
-    resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=100 * n,
-        messages=[{"role": "user", "content": prompt}],
+    req_file.write_text(
+        json.dumps({
+            "temp_rules": temp_rules,
+            "n":          n,
+            "items":      items,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
-    lines = [ln.strip() for ln in resp.content[0].text.strip().splitlines() if ln.strip()]
-    # 确保恰好 n 条：多截少补
-    fallback = "今日日报请补充具体内容。"
-    while len(lines) < n:
-        lines.append(lines[-1] if lines else fallback)
-    return lines[:n]
+
+    # 发送批量信号给轮询方（定时任务里的 Claude 会话）
+    print(f"[LLM_BATCH_REQUEST:{req_file}]", flush=True)
+
+    # 轮询等待批量响应（最多 180 秒）
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        if resp_file.exists():
+            try:
+                data = json.loads(resp_file.read_text(encoding="utf-8"))
+                resp_file.unlink()
+                # 期望格式：{"results": {"王牧天": ["comment1"], "王凯": ["comment2"], ...}}
+                return data.get("results", {})
+            except (json.JSONDecodeError, OSError):
+                pass  # 文件仍在写入，继续等
+        time.sleep(0.5)
+    else:
+        req_file.unlink(missing_ok=True)
+        raise RuntimeError("等待 Claude Desktop 批量响应超时（180 秒）")
 
 
 # ── CDP 拖选（isTrusted=true，可触发飞书工具栏）─────────────────
@@ -268,7 +296,6 @@ def extract_and_build_rows(date: str, n_comments: int = 1, temp_rules: list[str]
         member_names = [m["name"] for m in data["dates"][0]["members"]]
 
     print(f"  大纲成员列表（{len(member_names)} 人）: {member_names}")
-    rows = []
 
     # 辅助：通过 extract_content.js 提取（需要 heading2 在 DOM）
     def _fetch_blocks(member_name: str) -> list:
@@ -303,13 +330,17 @@ def extract_and_build_rows(date: str, n_comments: int = 1, temp_rules: list[str]
         _nav_click(date_coord)
         wait(1.5)
 
+    # ── 第一轮：逐个导航 + 提取 blocks（不调 LLM）────────────────
+    SKIP_TEXTS: set[str] = set()   # 可按需添加要跳过的固定文本
+    member_info: dict[str, dict] = {}  # name -> {valid_blocks, heading_id}
+
     for name in member_names:
-        # Step 2：按顺序点成员行（不回跳日期），让虚拟列表逐步向下渲染
+        # 按顺序点成员行，让虚拟列表逐步向下渲染
         member_coord = js(f'window.__navToMember("{date}", "{name}")')
         if "error" not in member_coord:
             _nav_click(member_coord)
 
-        # Step 3：轮询等待该成员的 heading3 出现在 DOM（最多 8 秒）
+        # 轮询等待该成员的 heading3 出现在 DOM（最多 8 秒）
         heading_id = None
         for _ in range(16):
             wait(0.5)
@@ -317,11 +348,9 @@ def extract_and_build_rows(date: str, n_comments: int = 1, temp_rules: list[str]
             if heading_id:
                 break
 
-        # Step 4：提取 rawBlocks（优先直接从 heading3 向下遍历，不依赖 heading2）
+        # 提取 rawBlocks（优先直接从 heading3 向下遍历，不依赖 heading2）
         blocks = _fetch_blocks_direct(heading_id) if heading_id else _fetch_blocks(name)
 
-        # Step 4：过滤有效 block
-        SKIP_TEXTS: set[str] = set()   # 可按需添加要跳过的固定文本
         valid_blocks = []
         for b in blocks:
             if b.get("type") == "todo":
@@ -331,10 +360,37 @@ def extract_and_build_rows(date: str, n_comments: int = 1, temp_rules: list[str]
                 continue
             valid_blocks.append((b, text))
 
+        member_info[name] = {"valid_blocks": valid_blocks, "heading_id": heading_id}
+
+    # ── 第二轮：一次性批量请求 LLM ────────────────────────────────
+    members_data = [
+        {
+            "member_name": name,
+            "full_text":   "\n".join(t for _, t in info["valid_blocks"]),
+        }
+        for name, info in member_info.items()
+        if info["valid_blocks"]
+    ]
+
+    batch_results: dict[str, list[str]] = {}
+    if members_data:
+        batch_results = _gen_comments_llm_batch(members_data, temp_rules, n_comments)
+
+    # ── 第三轮：组装 rows ─────────────────────────────────────────
+    fallback = "今日日报请补充具体内容。"
+    rows = []
+    for name in member_names:
+        info         = member_info[name]
+        valid_blocks = info["valid_blocks"]
+        heading_id   = info["heading_id"]
+
         if valid_blocks:
-            # 用临时规则 + LLM 生成 n_comments 条 comment
-            full_text = "\n".join(t for _, t in valid_blocks)
-            comments = _gen_comments_llm(name, full_text, temp_rules, n_comments)
+            comments = list(batch_results.get(name, []))
+            # 确保恰好 n_comments 条：多截少补
+            while len(comments) < n_comments:
+                comments.append(comments[-1] if comments else fallback)
+            comments = comments[:n_comments]
+
             for idx, comment in enumerate(comments):
                 # 尽量将不同 comment 分散到不同 block；超出时复用最后一个 block
                 block_idx = min(idx, len(valid_blocks) - 1)
